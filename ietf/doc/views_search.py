@@ -33,12 +33,11 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-
+import hashlib
+import json
 import re
 import datetime
 import copy
-import hashlib
-import json
 import operator
 
 from collections import defaultdict
@@ -46,17 +45,16 @@ from functools import reduce
 
 from django import forms
 from django.conf import settings
-from django.contrib import messages
 from django.core.cache import cache, caches
 from django.urls import reverse as urlreverse
 from django.db.models import Q
-from django.http import Http404, HttpResponseBadRequest, HttpResponse, HttpResponseRedirect
+from django.http import Http404, HttpResponseBadRequest, HttpResponse, HttpResponseRedirect, QueryDict
 from django.shortcuts import render
 from django.utils import timezone
 from django.utils.html import strip_tags
 from django.utils.cache import _generate_cache_key # type: ignore
 from django.utils.text import slugify
-from django_stubs_ext import QuerySetAny
+
 
 import debug                            # pyflakes:ignore
 
@@ -147,29 +145,6 @@ class SearchForm(forms.Form):
         if q['by'] != 'irtfstate':
             q['irtfstate'] = None
         return q
-
-    def cache_key_fragment(self):
-        """Hash a bound form to get a value for use in a cache key
-        
-        Raises a ValueError if the form is not valid.
-        """
-        def _serialize_value(val):
-            # Need QuerySetAny instead of QuerySet until django-stubs 5.0.1
-            if isinstance(val, QuerySetAny):
-                return [item.pk for item in val]
-            else:
-                return getattr(val, "pk", val)  # use pk if present, else value
-    
-        if not self.is_valid():
-            raise ValueError(f"SearchForm invalid: {self.errors}")
-        contents = {
-            field_name: _serialize_value(field_value)
-            for field_name, field_value in self.cleaned_data.items() 
-            if field_name != "sort" and field_value is not None
-        }
-        contents_json = json.dumps(contents, sort_keys=True)
-        return hashlib.sha512(contents_json.encode("utf-8")).hexdigest()
-
 
 def retrieve_search_results(form, all_types=False):
     """Takes a validated SearchForm and return the results."""
@@ -284,61 +259,49 @@ def retrieve_search_results(form, all_types=False):
 
 
 def search(request):
-    """Search for a draft"""
-    # defaults for results / meta
-    results = []
-    meta = {"by": None, "searching": False}
+    def _get_cache_key(params):
+        fields = set(SearchForm.base_fields) - {'sort'}
+        kwargs = dict([(k, v) for (k, v) in list(params.items()) if k in fields])
+        key = "doc:document:search:" + hashlib.sha512(json.dumps(kwargs, sort_keys=True).encode('utf-8')).hexdigest()
+        return key
 
-    if request.method == "POST":
-        form = SearchForm(data=request.POST)
-        if form.is_valid():
-            cache_key = f"doc:document:search:{form.cache_key_fragment()}"
-            cached_val = cache.get(cache_key)
-            if cached_val:
-                [results, meta] = cached_val
-            else:
-                results = retrieve_search_results(form)
-                results, meta = prepare_document_table(
-                    request, results, form.cleaned_data
-                )
-                cache.set(
-                    cache_key, [results, meta]
-                )  # for settings.CACHE_MIDDLEWARE_SECONDS
-                log(f"Search results computed for {form.cleaned_data}")
-            meta["searching"] = True
-    else:
-        if request.GET:
-            # backwards compatibility - fill in the form
-            get_params = request.GET.copy()
-            if "activeDrafts" in request.GET:
-                get_params["activedrafts"] = request.GET["activeDrafts"]
-            if "oldDrafts" in request.GET:
-                get_params["olddrafts"] = request.GET["oldDrafts"]
-            if "subState" in request.GET:
-                get_params["substate"] = request.GET["subState"]
-            form = SearchForm(data=get_params)
-            messages.error(
-                request,
-                (
-                    "Searching via the URL query string is no longer supported. "
-                    "The form below has been filled in with the parameters from your request. "
-                    'To execute your search, please click "Search".'
-                ),
-            )
+    if request.GET:
+        # backwards compatibility
+        get_params = request.GET.copy()
+        if 'activeDrafts' in request.GET:
+            get_params['activedrafts'] = request.GET['activeDrafts']
+        if 'oldDrafts' in request.GET:
+            get_params['olddrafts'] = request.GET['oldDrafts']
+        if 'subState' in request.GET:
+            get_params['substate'] = request.GET['subState']
+
+        form = SearchForm(get_params)
+        if not form.is_valid():
+            return HttpResponseBadRequest("form not valid: %s" % form.errors)
+
+        cache_key = _get_cache_key(get_params)
+        cached_val = cache.get(cache_key)
+        if cached_val:
+            [results, meta] = cached_val
         else:
-            form = SearchForm()
+            results = retrieve_search_results(form)
+            results, meta = prepare_document_table(request, results, get_params)
+            cache.set(cache_key, [results, meta]) # for settings.CACHE_MIDDLEWARE_SECONDS
+            log(f"Search results computed for {get_params}")
+        meta['searching'] = True
+    else:
+        form = SearchForm()
+        results = []
+        meta = { 'by': None, 'searching': False }
+        get_params = QueryDict('')
 
-    return render(
-        request,
-        "doc/search/search.html",
-        context={"form": form, "docs": results, "meta": meta},
+    return render(request, 'doc/search/search.html', {
+        'form':form, 'docs':results, 'meta':meta, 'queryargs':get_params.urlencode() },
     )
-
 
 def frontpage(request):
     form = SearchForm()
     return render(request, 'doc/frontpage.html', {'form':form})
-
 
 def search_for_name(request, name):
     def find_unique(n):
@@ -785,6 +748,90 @@ def docs_for_ad(request, name):
             "ad": ad,
             "blocked_docs": blocked_docs,
             "not_balloted_docs": not_balloted_docs,
+        },
+    )
+
+
+def docs_for_iesg(request):
+    def sort_key(doc):
+        dt = doc_type(doc)
+        dt_key = list(AD_WORKLOAD.keys()).index(dt)
+        ds = doc_state(doc)
+        ds_key = AD_WORKLOAD[dt].index(ds) if ds in AD_WORKLOAD[dt] else 99
+        return dt_key * 100 + ds_key
+
+    results, meta = prepare_document_table(
+        request,
+        Document.objects.filter(
+            ad__in=Person.objects.filter(
+                Q(
+                    role__name__in=("pre-ad", "ad"),
+                    role__group__type="area",
+                    role__group__state="active",
+                )
+            )
+        ).exclude(
+            type_id="rfc",
+        ).exclude(
+            type_id="draft",
+            states__type="draft", 
+            states__slug__in=["repl", "rfc"],
+        ).exclude(
+            type_id="draft",
+            states__type="draft-iesg",
+            states__slug__in=["idexists", "rfcqueue"],
+        ).exclude(
+            type_id="conflrev",
+            states__type="conflrev",
+            states__slug__in=["appr-noprob-sent", "appr-reqnopub-sent", "withdraw", "dead"],
+        ).exclude(
+            type_id="statchg",
+            states__type="statchg",
+            states__slug__in=["appr-sent", "dead"],
+        ).exclude(
+            type_id="charter",
+            states__type="charter",
+            states__slug__in=["notrev", "infrev", "approved", "replaced"],
+        ),
+        max_results=1000,
+        show_ad_and_shepherd=True,
+    )
+    results.sort(key=lambda d: sort_key(d))
+
+    # filter out some results
+    results = [
+        r
+        for r in results
+        if not (
+            r.type_id == "charter"
+            and (
+                r.group.state_id == "abandon"
+                or r.get_state_slug("charter") == "replaced"
+            )
+        )
+        and not (
+            r.type_id == "draft"
+            and (
+                r.get_state_slug("draft-iesg") == "dead"
+                or r.get_state_slug("draft") == "repl"
+                or r.get_state_slug("draft") == "rfc"
+            )
+        )
+    ]
+
+    _calculate_state_name = get_state_name_calculator()
+    for d in results:
+        dt = d.type.slug
+        d.search_heading = _calculate_state_name(dt, doc_state(d))
+        if d.search_heading != "RFC":
+            d.search_heading += f" {doc_type_name(dt)}"
+
+    return render(
+        request,
+        "doc/drafts_for_iesg.html",
+        {
+            "docs": results,
+            "meta": meta,
         },
     )
 

@@ -12,6 +12,8 @@ from urllib.parse import quote as urlquote
 
 from django.conf import settings
 from django.contrib.auth import REDIRECT_FIELD_NAME
+from django.contrib.sites.models import Site
+from django.core import signing
 from django.core.exceptions import PermissionDenied
 from django.db.models import Q
 from django.http import HttpResponseRedirect
@@ -20,9 +22,10 @@ from django.shortcuts import get_object_or_404
 import debug                            # pyflakes:ignore
 
 from ietf.group.models import Role, GroupFeatures
-from ietf.person.models import Person
+from ietf.person.models import Email, Person
 from ietf.person.utils import get_dots
 from ietf.doc.utils_bofreq import bofreq_editors
+from ietf.utils.mail import send_mail
 
 def user_is_person(user, person):
     """Test whether user is associated with person."""
@@ -133,6 +136,10 @@ def has_role(user, role_names, *args, **kwargs):
                 name="liaiman",
                 group__type="sdo",
                 group__state="active",
+            ),
+            "Liaison Coordinator": Q(
+                name="liaison_coordinator",
+                group__acronym="iab",
             ),
             "Authorized Individual": Q(
                 name="auth",
@@ -343,13 +350,14 @@ class OidcExtraScopeClaims(oidc_provider.lib.claims.ScopeClaims):
         )
 
     def scope_registration(self):
+        # import here to avoid circular imports
         from ietf.meeting.helpers import get_current_ietf_meeting
-        from ietf.stats.models import MeetingRegistration
+        from ietf.meeting.models import Registration
         meeting = get_current_ietf_meeting()
         person = self.user.person
         email_list = person.email_set.values_list('address')
         q = Q(person=person, meeting=meeting) | Q(email__in=email_list, meeting=meeting)
-        regs = MeetingRegistration.objects.filter(q).distinct()
+        regs = Registration.objects.filter(q).distinct()
         for reg in regs:
             if not reg.person_id:
                 reg.person = person
@@ -360,19 +368,20 @@ class OidcExtraScopeClaims(oidc_provider.lib.claims.ScopeClaims):
             ticket_types = set([])
             reg_types = set([])
             for reg in regs:
-                ticket_types.add(reg.ticket_type)
-                reg_types.add(reg.reg_type)
+                for ticket in reg.tickets.all():
+                    ticket_types.add(ticket.ticket_type.slug)
+                    reg_types.add(ticket.attendance_type.slug)
             info = {
-                'meeting':      meeting.number,
+                'meeting': meeting.number,
                 # full_week, one_day, student:
-                'ticket_type':  ' '.join(ticket_types),
+                'ticket_type': ' '.join(ticket_types),
                 # onsite, remote, hackathon_onsite, hackathon_remote:
-                'reg_type':     ' '.join(reg_types),
-                'affiliation':  ([ reg.affiliation for reg in regs if reg.affiliation ] or [''])[0],
+                'reg_type': ' '.join(reg_types),
+                'affiliation': ([reg.affiliation for reg in regs if reg.affiliation] or [''])[0],
             }
 
         return info
-            
+
 def can_request_rfc_publication(user, doc):
     """Answers whether this user has an appropriate role to send this document to the RFC Editor for publication as an RFC.
 
@@ -394,3 +403,47 @@ def can_request_rfc_publication(user, doc):
         return False # See the docstring
     else:
         return False
+
+
+def send_new_email_confirmation_request(person: Person, address: str):
+    """Request confirmation of a new email address
+    
+    If the email address is already in use, sends an alert to it. If not, sends a confirmation request.
+    By design, does not indicate which was sent. This is intended to make it a bit harder to scrape addresses
+    with a mindless bot.
+    """
+    auth = signing.dumps([person.user.username, address], salt="add_email")
+    domain = Site.objects.get_current().domain
+    from_email = settings.DEFAULT_FROM_EMAIL
+
+    existing = Email.objects.filter(address=address).first()
+    if existing:
+        subject = f"Attempt to add your email address by {person.name}"
+        send_mail(
+            None,
+            address,
+            from_email,
+            subject,
+            "registration/add_email_exists_email.txt",
+            {
+                "domain": domain,
+                "email": address,
+                "person": person,
+            },
+        )
+    else:
+        subject = f"Confirm email address for {person.name}"
+        send_mail(
+            None,
+            address,
+            from_email,
+            subject,
+            "registration/add_email_email.txt",
+            {
+                "domain": domain,
+                "auth": auth,
+                "email": address,
+                "person": person,
+                "expire": settings.DAYS_TO_EXPIRE_REGISTRATION_LINK,
+            },
+        )

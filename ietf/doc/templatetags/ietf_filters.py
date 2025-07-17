@@ -26,10 +26,11 @@ import debug                            # pyflakes:ignore
 from ietf.doc.models import BallotDocEvent, Document
 from ietf.doc.models import ConsensusDocEvent
 from ietf.ietfauth.utils import can_request_rfc_publication as utils_can_request_rfc_publication
-from ietf.utils.html import sanitize_fragment
 from ietf.utils import log
 from ietf.doc.utils import prettify_std_name
-from ietf.utils.text import wordwrap, fill, wrap_text_if_unwrapped, bleach_linker, bleach_cleaner, validate_url
+from ietf.utils.html import clean_html
+from ietf.utils.text import wordwrap, fill, wrap_text_if_unwrapped, linkify
+from ietf.utils.validators import validate_url
 
 register = template.Library()
 
@@ -98,7 +99,7 @@ def sanitize(value):
     attributes to those deemed acceptable.  See ietf/utils/html.py
     for the details.
     """
-    return mark_safe(sanitize_fragment(value))
+    return mark_safe(clean_html(value))
 
 
 # For use with ballot view
@@ -284,7 +285,7 @@ def urlize_related_source_list(related, document_html=False):
                                                                       url=url)
         ))
     return links
-        
+
 @register.filter(name='urlize_related_target_list', is_safe=True, document_html=False)
 def urlize_related_target_list(related, document_html=False):
     """Convert a list of RelatedDocuments into list of links using the target document's canonical name"""
@@ -301,7 +302,7 @@ def urlize_related_target_list(related, document_html=False):
                                                                       url=url)
         ))
     return links
-        
+
 @register.filter(name='dashify')
 def dashify(string):
     """
@@ -446,16 +447,16 @@ def ad_area(user):
 @register.filter
 def format_history_text(text, trunc_words=25):
     """Run history text through some cleaning and add ellipsis if it's too long."""
-    full = mark_safe(bleach_cleaner.clean(text))
-    full = bleach_linker.linkify(urlize_ietf_docs(full))
+    full = mark_safe(clean_html(text))
+    full = linkify(urlize_ietf_docs(full))
 
     return format_snippet(full, trunc_words)
 
 @register.filter
 def format_snippet(text, trunc_words=25): 
     # urlize if there aren't already links present
-    text = bleach_linker.linkify(text)
-    full = keep_spacing(collapsebr(linebreaksbr(mark_safe(sanitize_fragment(text)))))
+    text = linkify(text)
+    full = keep_spacing(collapsebr(linebreaksbr(mark_safe(clean_html(text)))))
     snippet = truncatewords_html(full, trunc_words)
     if snippet != full:
         return mark_safe('<div class="snippet">%s<button type="button" aria-label="Expand" class="btn btn-sm btn-primary show-all"><i class="bi bi-caret-down"></i></button></div><div class="d-none full">%s</div>' % (snippet, full))
@@ -478,6 +479,19 @@ def state(doc, slug):
     if slug == "stream": # convenient shorthand
         slug = "%s-stream-%s" % (doc.type_id, doc.stream_id)
     return doc.get_state(slug)
+
+
+@register.filter
+def is_unexpected_wg_state(doc):
+    """Returns a flag indicating whether the document has an unexpected wg state."""
+    if not doc.type_id == "draft":
+        return False
+
+    draft_iesg_state = doc.get_state("draft-iesg")
+    draft_stream_state = doc.get_state("draft-stream-ietf")
+
+    return draft_iesg_state.slug != "idexists" and draft_stream_state is not None and draft_stream_state.slug != "sub-pub"
+
 
 @register.filter
 def statehelp(state):
@@ -507,10 +521,52 @@ def plural(text, seq, arg='s'):
     else:
         return text + pluralize(len(seq), arg)
 
+
+# Translation table to escape ICS characters. The {} | {} construction builds up a dict
+# mapping characters to arbitrary-length strings or None. Values in later dicts override
+# earlier ones prior to conversion to a translation table, so excluding a char and then
+# mapping it to an escape sequence results in its being escaped, not dropped.
+rfc5545_text_escapes = str.maketrans(
+    # text       = *(TSAFE-CHAR / ":" / DQUOTE / ESCAPED-CHAR)
+    # TSAFE-CHAR = WSP / %x21 / %x23-2B / %x2D-39 / %x3C-5B /
+    #                    %x5D-7E / NON-US-ASCII
+    {chr(c): None for c in range(0x00, 0x20)}  # strip 0x00-0x20
+    | {
+        # ESCAPED-CHAR = ("\\" / "\;" / "\," / "\N" / "\n")
+        "\n": r"\n",
+        ";": r"\;",
+        ",": r"\,",
+        "\\": r"\\",  # rhs is two backslashes!
+        "\t": "\t",  # htab ok (0x09)
+        " ": " ",  # space ok (0x20)
+    }
+)
+
+
 @register.filter
 def ics_esc(text):
-    text = re.sub(r"([\n,;\\])", r"\\\1", text)
-    return text
+    """Escape a string to use in an iCalendar text context
+    
+    >>> ics_esc('simple')
+    'simple'
+    
+    For the next tests, it helps to know:
+      chr(0x09) = "\t"
+      chr(0x0a) = "\n"
+      chr(0x0d) = "\r"
+      chr(0x5c) = "\\"
+    
+    >>> ics_esc(f'strips{chr(0x0d)}out{chr(0x0d)}LFs')
+    'stripsoutLFs'
+    
+    
+    >>> ics_esc(f'escapes;and,and{chr(0x5c)}and{chr(0x0a)}')
+    'escapes\\\\;and\\\\,and\\\\\\\\and\\\\n'
+    
+    >>> ics_esc(f"keeps spaces : and{chr(0x09)}tabs")
+    'keeps spaces : and\\ttabs'
+    """
+    return text.translate(rfc5545_text_escapes)
 
 
 @register.simple_tag
@@ -532,15 +588,18 @@ def ics_date_time(dt, tzname):
     >>> ics_date_time(datetime.datetime(2022,1,2,3,4,5), 'UTC')
     ':20220102T030405Z'
 
+    >>> ics_date_time(datetime.datetime(2022,1,2,3,4,5), 'GmT')
+    ':20220102T030405Z'
+
     >>> ics_date_time(datetime.datetime(2022,1,2,3,4,5), 'America/Los_Angeles')
     ';TZID=America/Los_Angeles:20220102T030405'
     """
     timestamp = dt.strftime('%Y%m%dT%H%M%S')
-    if tzname.lower() == 'utc':
+    if tzname.lower() in ('gmt', 'utc'):
         return f':{timestamp}Z'
     else:
         return f';TZID={ics_esc(tzname)}:{timestamp}'
-    
+
 @register.filter
 def next_day(value):
     return value + datetime.timedelta(days=1)
@@ -659,7 +718,7 @@ def rfcbis(s):
 @stringfilter
 def urlize(value):
     raise RuntimeError("Use linkify from textfilters instead of urlize")
-    
+
 @register.filter
 @stringfilter
 def charter_major_rev(rev):

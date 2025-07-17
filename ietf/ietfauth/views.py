@@ -38,14 +38,14 @@ import datetime
 import importlib
 
 # needed if we revert to higher barrier for account creation
-#from datetime import datetime as DateTime, timedelta as TimeDelta, date as Date
+# from datetime import datetime as DateTime, timedelta as TimeDelta, date as Date
 from collections import defaultdict
 
 import django.core.signing
 from django import forms
 from django.contrib import messages
 from django.conf import settings
-from django.contrib.auth import logout, update_session_auth_hash
+from django.contrib.auth import logout, update_session_auth_hash, password_validation
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import AuthenticationForm
 from django.contrib.auth.hashers import identify_hasher
@@ -65,7 +65,7 @@ from ietf.group.models import Role, Group
 from ietf.ietfauth.forms import ( RegistrationForm, PasswordForm, ResetPasswordForm, TestEmailForm,
                                 ChangePasswordForm, get_person_form, RoleEmailForm,
                                 NewEmailForm, ChangeUsernameForm, PersonPasswordForm)
-from ietf.ietfauth.utils import has_role
+from ietf.ietfauth.utils import has_role, send_new_email_confirmation_request
 from ietf.name.models import ExtResourceName
 from ietf.nomcom.models import NomCom
 from ietf.person.models import Person, Email, Alias, PersonalApiKey, PERSON_API_KEY_VALUES
@@ -78,7 +78,6 @@ from ietf.utils.validators import validate_external_resource_value
 from ietf.utils.timezone import date_today, DEADLINE_TZINFO
 
 # These are needed if we revert to the higher bar for account creation
-
 
 
 def index(request):
@@ -97,7 +96,7 @@ def index(request):
 # def ietf_login(request):
 #     if not request.user.is_authenticated:
 #         return HttpResponse("Not authenticated?", status=500)
-# 
+#
 #     redirect_to = request.REQUEST.get(REDIRECT_FIELD_NAME, '')
 #     request.session.set_test_cookie()
 #     return HttpResponseRedirect('/accounts/loggedin/?%s=%s' % (REDIRECT_FIELD_NAME, urlquote(redirect_to)))
@@ -297,31 +296,8 @@ def profile(request):
                 to_email = f.cleaned_data["new_email"]
                 if not to_email:
                     continue
-
                 email_confirmations.append(to_email)
-
-                auth = django.core.signing.dumps([person.user.username, to_email], salt="add_email")
-
-                domain = Site.objects.get_current().domain
-                from_email = settings.DEFAULT_FROM_EMAIL
-
-                existing = Email.objects.filter(address=to_email).first()
-                if existing:
-                    subject = 'Attempt to add your email address by %s' % person.name
-                    send_mail(request, to_email, from_email, subject, 'registration/add_email_exists_email.txt', {
-                        'domain': domain,
-                        'email': to_email,
-                        'person': person,
-                    })
-                else:
-                    subject = 'Confirm email address for %s' % person.name
-                    send_mail(request, to_email, from_email, subject, 'registration/add_email_email.txt', {
-                        'domain': domain,
-                        'auth': auth,
-                        'email': to_email,
-                        'person': person,
-                        'expire': settings.DAYS_TO_EXPIRE_REGISTRATION_LINK,
-                    })
+                send_new_email_confirmation_request(person, to_email)
 
             for r in roles:
                 e = r.email_form.cleaned_data["email"]
@@ -553,7 +529,7 @@ def confirm_password_reset(request, auth):
         )
     success = False
     if request.method == 'POST':
-        form = PasswordForm(request.POST)
+        form = PasswordForm(user=user, data=request.POST)
         if form.is_valid():
             password = form.cleaned_data["password"]
 
@@ -562,7 +538,7 @@ def confirm_password_reset(request, auth):
 
             success = True
     else:
-        form = PasswordForm()
+        form = PasswordForm(user=user)
 
     hlibname, hashername = settings.PASSWORD_HASHERS[0].rsplit('.',1)
     hlib = importlib.import_module(hlibname)
@@ -603,7 +579,6 @@ def test_email(request):
         r.set_cookie("testmailcc", cookie)
 
     return r
-
 
 
 class AddReviewWishForm(forms.Form):
@@ -694,7 +669,7 @@ def change_password(request):
     if request.method == 'POST':
         form = ChangePasswordForm(user, request.POST)
         if form.is_valid():
-            new_password = form.cleaned_data["new_password"]
+            new_password = form.cleaned_data["password"]
             
             user.set_password(new_password)
             user.save()
@@ -719,7 +694,7 @@ def change_password(request):
         'hasher': hasher,
     })
 
-    
+
 @login_required
 @person_required
 def change_username(request):
@@ -787,6 +762,28 @@ class AnyEmailAuthenticationForm(AuthenticationForm):
                 )
         return super().clean()
 
+    def confirm_login_allowed(self, user):
+        """Check whether a successfully authenticated user is permitted to log in"""
+        super().confirm_login_allowed(user)
+        # Optionally enforce password validation
+        if getattr(settings, "PASSWORD_POLICY_ENFORCE_AT_LOGIN", False):
+            try:
+                password_validation.validate_password(
+                    self.cleaned_data["password"], user
+                )
+            except ValidationError:
+                raise ValidationError(
+                    # dict mapping field to error / error list
+                    {
+                        "__all__": ValidationError(
+                            'You entered your password correctly, but it  does not '
+                            'meet our current length and complexity requirements. '
+                            'Please use the "Forgot your password?" button below to '
+                            'set a new password for your account.'
+                        ),
+                    }
+                )
+
 
 class AnyEmailLoginView(LoginView):
     """LoginView that allows any email address as the username
@@ -802,7 +799,7 @@ class AnyEmailLoginView(LoginView):
             logout(self.request)  # should not be logged in yet, but just in case...
             return render(self.request, "registration/missing_person.html")
         return super().form_valid(form)
-        
+
 
 @login_required
 @person_required
